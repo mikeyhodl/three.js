@@ -59,6 +59,7 @@
     "test-unit-examples": "npm run unit-examples --prefix test",
     "test-e2e": "node test/e2e/puppeteer.js",
     "test-e2e-cov": "node test/e2e/check-coverage.js",
+    "test-treeshake": "rollup -c test/rollup.treeshake.config.js",
     "make-screenshot": "node test/e2e/puppeteer.js --make"
   },
   "keywords": [
