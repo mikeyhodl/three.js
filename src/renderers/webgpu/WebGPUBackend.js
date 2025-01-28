@@ -14,15 +14,44 @@ import WebGPUPipelineUtils from './utils/WebGPUPipelineUtils.js';
 import WebGPUTextureUtils from './utils/WebGPUTextureUtils.js';
 
 import { WebGPUCoordinateSystem } from '../../constants.js';
+import WebGPUTimestampQueryPool from './utils/WebGPUTimestampQueryPool.js';
 
-//
-
+/**
+ * A backend implementation targeting WebGPU.
+ *
+ * @private
+ * @augments Backend
+ */
 class WebGPUBackend extends Backend {
 
+	/**
+	 * Constructs a new WebGPU backend.
+	 *
+	 * @param {Object} parameters - The configuration parameter.
+	 * @param {Boolean} [parameters.logarithmicDepthBuffer=false] - Whether logarithmic depth buffer is enabled or not.
+	 * @param {Boolean} [parameters.alpha=true] - Whether the default framebuffer (which represents the final contents of the canvas) should be transparent or opaque.
+	 * @param {Boolean} [parameters.depth=true] - Whether the default framebuffer should have a depth buffer or not.
+	 * @param {Boolean} [parameters.stencil=false] - Whether the default framebuffer should have a stencil buffer or not.
+	 * @param {Boolean} [parameters.antialias=false] - Whether MSAA as the default anti-aliasing should be enabled or not.
+	 * @param {Number} [parameters.samples=0] - When `antialias` is `true`, `4` samples are used by default. Set this parameter to any other integer value than 0 to overwrite the default.
+	 * @param {Boolean} [parameters.forceWebGL=false] - If set to `true`, the renderer uses a WebGL 2 backend no matter if WebGPU is supported or not.
+	 * @param {Boolean} [parameters.trackTimestamp=false] - Whether to track timestamps with a Timestamp Query API or not.
+	 * @param {String} [parameters.powerPreference=undefined] - The power preference.
+	 * @param {Object} [parameters.requiredLimits=undefined] - Specifies the limits that are required by the device request. The request will fail if the adapter cannot provide these limits.
+	 * @param {GPUDevice} [parameters.device=undefined] - If there is an existing GPU device on app level, it can be passed to the renderer as a parameter.
+	 * @param {Number} [parameters.outputType=undefined] - Texture type for output to canvas. By default, device's preferred format is used; other formats may incur overhead.
+	 */
 	constructor( parameters = {} ) {
 
 		super( parameters );
 
+		/**
+		 * This flag can be used for type testing.
+		 *
+		 * @type {Boolean}
+		 * @readonly
+		 * @default true
+		 */
 		this.isWebGPUBackend = true;
 
 		// some parameters require default values other than "undefined"
@@ -30,22 +59,101 @@ class WebGPUBackend extends Backend {
 
 		this.parameters.requiredLimits = ( parameters.requiredLimits === undefined ) ? {} : parameters.requiredLimits;
 
+		/**
+		 * Whether to track timestamps with a Timestamp Query API or not.
+		 *
+		 * @type {Boolean}
+		 * @default false
+		 */
 		this.trackTimestamp = ( parameters.trackTimestamp === true );
 
+		/**
+		 * A reference to the device.
+		 *
+		 * @type {GPUDevice?}
+		 * @default null
+		 */
 		this.device = null;
+
+		/**
+		 * A reference to the context.
+		 *
+		 * @type {GPUCanvasContext?}
+		 * @default null
+		 */
 		this.context = null;
+
+		/**
+		 * A reference to the color attachment of the default framebuffer.
+		 *
+		 * @type {GPUTexture?}
+		 * @default null
+		 */
 		this.colorBuffer = null;
+
+		/**
+		 * A reference to the default render pass descriptor.
+		 *
+		 * @type {Object?}
+		 * @default null
+		 */
 		this.defaultRenderPassdescriptor = null;
 
+		/**
+		 * A reference to a backend module holding common utility functions.
+		 *
+		 * @type {WebGPUUtils}
+		 */
 		this.utils = new WebGPUUtils( this );
+
+		/**
+		 * A reference to a backend module holding shader attribute-related
+		 * utility functions.
+		 *
+		 * @type {WebGPUAttributeUtils}
+		 */
 		this.attributeUtils = new WebGPUAttributeUtils( this );
+
+		/**
+		 * A reference to a backend module holding shader binding-related
+		 * utility functions.
+		 *
+		 * @type {WebGPUBindingUtils}
+		 */
 		this.bindingUtils = new WebGPUBindingUtils( this );
+
+		/**
+		 * A reference to a backend module holding shader pipeline-related
+		 * utility functions.
+		 *
+		 * @type {WebGPUPipelineUtils}
+		 */
 		this.pipelineUtils = new WebGPUPipelineUtils( this );
+
+		/**
+		 * A reference to a backend module holding shader texture-related
+		 * utility functions.
+		 *
+		 * @type {WebGPUTextureUtils}
+		 */
 		this.textureUtils = new WebGPUTextureUtils( this );
+
+		/**
+		 * A map that manages the resolve buffers for occlusion queries.
+		 *
+		 * @type {Map<Number,GPUBuffer>}
+		 */
 		this.occludedResolveCache = new Map();
 
 	}
 
+	/**
+	 * Initializes the backend so it is ready for usage.
+	 *
+	 * @async
+	 * @param {Renderer} renderer - The renderer.
+	 * @return {Promise} A Promise that resolves when the backend has been initialized.
+	 */
 	async init( renderer ) {
 
 		await super.init( renderer );
@@ -64,7 +172,7 @@ class WebGPUBackend extends Backend {
 				powerPreference: parameters.powerPreference
 			};
 
-			const adapter = await navigator.gpu.requestAdapter( adapterOptions );
+			const adapter = ( typeof navigator !== 'undefined' ) ? await navigator.gpu.requestAdapter( adapterOptions ) : null;
 
 			if ( adapter === null ) {
 
@@ -101,6 +209,19 @@ class WebGPUBackend extends Backend {
 
 		}
 
+		device.lost.then( ( info ) => {
+
+			const deviceLossInfo = {
+				api: 'WebGPU',
+				message: info.message || 'Unknown reason',
+				reason: info.reason || null,
+				originalEvent: info
+			};
+
+			renderer.onDeviceLost( deviceLossInfo );
+
+		} );
+
 		const context = ( parameters.context !== undefined ) ? parameters.context : renderer.domElement.getContext( 'webgpu' );
 
 		this.device = device;
@@ -121,24 +242,53 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * The coordinate system of the backend.
+	 *
+	 * @type {Number}
+	 * @readonly
+	 */
 	get coordinateSystem() {
 
 		return WebGPUCoordinateSystem;
 
 	}
 
+	/**
+	 * This method performs a readback operation by moving buffer data from
+	 * a storage buffer attribute from the GPU to the CPU.
+	 *
+	 * @async
+	 * @param {StorageBufferAttribute} attribute - The storage buffer attribute.
+	 * @return {Promise<ArrayBuffer>} A promise that resolves with the buffer data when the data are ready.
+	 */
 	async getArrayBufferAsync( attribute ) {
 
 		return await this.attributeUtils.getArrayBufferAsync( attribute );
 
 	}
 
+	/**
+	 * Returns the backend's rendering context.
+	 *
+	 * @return {GPUCanvasContext} The rendering context.
+	 */
 	getContext() {
 
 		return this.context;
 
 	}
 
+	/**
+	 * Returns the default render pass descriptor.
+	 *
+	 * In WebGPU, the default framebuffer must be configured
+	 * like custom framebuffers so the backend needs a render
+	 * pass descriptor even when rendering directly to screen.
+	 *
+	 * @private
+	 * @return {Object} The render pass descriptor.
+	 */
 	_getDefaultRenderPassDescriptor() {
 
 		let descriptor = this.defaultRenderPassdescriptor;
@@ -193,7 +343,15 @@ class WebGPUBackend extends Backend {
 
 	}
 
-	_getRenderPassDescriptor( renderContext ) {
+	/**
+	 * Returns the render pass descriptor for the given render context.
+	 *
+	 * @private
+	 * @param {RenderContext} renderContext - The render context.
+	 * @param {Object} colorAttachmentsConfig - Configuration object for the color attachments.
+	 * @return {Object} The render pass descriptor.
+	 */
+	_getRenderPassDescriptor( renderContext, colorAttachmentsConfig = {} ) {
 
 		const renderTarget = renderContext.renderTarget;
 		const renderTargetData = this.get( renderTarget );
@@ -203,8 +361,11 @@ class WebGPUBackend extends Backend {
 		if ( descriptors === undefined ||
 			renderTargetData.width !== renderTarget.width ||
 			renderTargetData.height !== renderTarget.height ||
+			renderTargetData.dimensions !== renderTarget.dimensions ||
 			renderTargetData.activeMipmapLevel !== renderTarget.activeMipmapLevel ||
-			renderTargetData.samples !== renderTarget.samples
+			renderTargetData.activeCubeFace !== renderContext.activeCubeFace ||
+			renderTargetData.samples !== renderTarget.samples ||
+			renderTargetData.loadOp !== colorAttachmentsConfig.loadOp
 		) {
 
 			descriptors = {};
@@ -234,16 +395,37 @@ class WebGPUBackend extends Backend {
 			const textures = renderContext.textures;
 			const colorAttachments = [];
 
+			let sliceIndex;
+
 			for ( let i = 0; i < textures.length; i ++ ) {
 
 				const textureData = this.get( textures[ i ] );
 
-				const textureView = textureData.texture.createView( {
+				const viewDescriptor = {
+					label: `colorAttachment_${ i }`,
 					baseMipLevel: renderContext.activeMipmapLevel,
 					mipLevelCount: 1,
 					baseArrayLayer: renderContext.activeCubeFace,
+					arrayLayerCount: 1,
 					dimension: GPUTextureViewDimension.TwoD
-				} );
+				};
+
+				if ( renderTarget.isRenderTarget3D ) {
+
+					sliceIndex = renderContext.activeCubeFace;
+
+					viewDescriptor.baseArrayLayer = 0;
+					viewDescriptor.dimension = GPUTextureViewDimension.ThreeD;
+					viewDescriptor.depthOrArrayLayers = textures[ i ].image.depth;
+
+				} else if ( renderTarget.isRenderTargetArray ) {
+
+					viewDescriptor.dimension = GPUTextureViewDimension.TwoDArray;
+					viewDescriptor.depthOrArrayLayers = textures[ i ].image.depth;
+
+				}
+
+				const textureView = textureData.texture.createView( viewDescriptor );
 
 				let view, resolveTarget;
 
@@ -261,9 +443,11 @@ class WebGPUBackend extends Backend {
 
 				colorAttachments.push( {
 					view,
+					depthSlice: sliceIndex,
 					resolveTarget,
 					loadOp: GPULoadOp.Load,
-					storeOp: GPUStoreOp.Store
+					storeOp: GPUStoreOp.Store,
+					...colorAttachmentsConfig
 				} );
 
 			}
@@ -289,7 +473,11 @@ class WebGPUBackend extends Backend {
 			renderTargetData.width = renderTarget.width;
 			renderTargetData.height = renderTarget.height;
 			renderTargetData.samples = renderTarget.samples;
-			renderTargetData.activeMipmapLevel = renderTarget.activeMipmapLevel;
+			renderTargetData.activeMipmapLevel = renderContext.activeMipmapLevel;
+			renderTargetData.activeCubeFace = renderContext.activeCubeFace;
+			renderTargetData.dimensions = renderTarget.dimensions;
+			renderTargetData.depthSlice = sliceIndex;
+			renderTargetData.loadOp = colorAttachments[ 0 ].loadOp;
 
 		}
 
@@ -297,6 +485,12 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * This method is executed at the beginning of a render call and prepares
+	 * the WebGPU state for upcoming render calls
+	 *
+	 * @param {RenderContext} renderContext - The render context.
+	 */
 	beginRender( renderContext ) {
 
 		const renderContextData = this.get( renderContext );
@@ -319,7 +513,7 @@ class WebGPUBackend extends Backend {
 
 			//
 
-			occlusionQuerySet = device.createQuerySet( { type: 'occlusion', count: occlusionQueryCount } );
+			occlusionQuerySet = device.createQuerySet( { type: 'occlusion', count: occlusionQueryCount, label: `occlusionQuerySet_${ renderContext.id }` } );
 
 			renderContextData.occlusionQuerySet = occlusionQuerySet;
 			renderContextData.occlusionQueryIndex = 0;
@@ -337,7 +531,7 @@ class WebGPUBackend extends Backend {
 
 		} else {
 
-			descriptor = this._getRenderPassDescriptor( renderContext );
+			descriptor = this._getRenderPassDescriptor( renderContext, { loadOp: GPULoadOp.Load } );
 
 		}
 
@@ -456,6 +650,12 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * This method is executed at the end of a render call and finalizes work
+	 * after draw calls.
+	 *
+	 * @param {RenderContext} renderContext - The render context.
+	 */
 	finishRender( renderContext ) {
 
 		const renderContextData = this.get( renderContext );
@@ -517,8 +717,6 @@ class WebGPUBackend extends Backend {
 
 		}
 
-		this.prepareTimestampBuffer( renderContext, renderContextData.encoder );
-
 		this.device.queue.submit( [ renderContextData.encoder.finish() ] );
 
 
@@ -544,6 +742,14 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * Returns `true` if the given 3D object is fully occluded by other
+	 * 3D objects in the scene.
+	 *
+	 * @param {RenderContext} renderContext - The render context.
+	 * @param {Object3D} object - The 3D object to test.
+	 * @return {Boolean} Whether the 3D object is fully occluded or not.
+	 */
 	isOccluded( renderContext, object ) {
 
 		const renderContextData = this.get( renderContext );
@@ -552,6 +758,14 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * This method processes the result of occlusion queries and writes it
+	 * into render context data.
+	 *
+	 * @async
+	 * @param {RenderContext} renderContext - The render context.
+	 * @return {Promise} A Promise that resolves when the occlusion query results have been processed.
+	 */
 	async resolveOccludedAsync( renderContext ) {
 
 		const renderContextData = this.get( renderContext );
@@ -574,7 +788,7 @@ class WebGPUBackend extends Backend {
 
 			for ( let i = 0; i < currentOcclusionQueryObjects.length; i ++ ) {
 
-				if ( results[ i ] !== BigInt( 0 ) ) {
+				if ( results[ i ] === BigInt( 0 ) ) {
 
 					occluded.add( currentOcclusionQueryObjects[ i ] );
 
@@ -590,6 +804,11 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * Updates the viewport with the values from the given render context.
+	 *
+	 * @param {RenderContext} renderContext - The render context.
+	 */
 	updateViewport( renderContext ) {
 
 		const { currentPass } = this.get( renderContext );
@@ -599,7 +818,15 @@ class WebGPUBackend extends Backend {
 
 	}
 
-	clear( color, depth, stencil, renderTargetData = null ) {
+	/**
+	 * Performs a clear operation.
+	 *
+	 * @param {Boolean} color - Whether the color buffer should be cleared or not.
+	 * @param {Boolean} depth - Whether the depth buffer should be cleared or not.
+	 * @param {Boolean} stencil - Whether the stencil buffer should be cleared or not.
+	 * @param {RenderContext?} [renderTargetContext=null] - The render context of the current set render target.
+	 */
+	clear( color, depth, stencil, renderTargetContext = null ) {
 
 		const device = this.device;
 		const renderer = this.renderer;
@@ -632,7 +859,7 @@ class WebGPUBackend extends Backend {
 
 		}
 
-		if ( renderTargetData === null ) {
+		if ( renderTargetContext === null ) {
 
 			supportsDepth = renderer.depth;
 			supportsStencil = renderer.stencil;
@@ -659,45 +886,20 @@ class WebGPUBackend extends Backend {
 
 		} else {
 
-			supportsDepth = renderTargetData.depth;
-			supportsStencil = renderTargetData.stencil;
+			supportsDepth = renderTargetContext.depth;
+			supportsStencil = renderTargetContext.stencil;
 
 			if ( color ) {
 
-				for ( const texture of renderTargetData.textures ) {
+				const descriptor = this._getRenderPassDescriptor( renderTargetContext, { loadOp: GPULoadOp.Clear, clearValue } );
 
-					const textureData = this.get( texture );
-					const textureView = textureData.texture.createView();
-
-					let view, resolveTarget;
-
-					if ( textureData.msaaTexture !== undefined ) {
-
-						view = textureData.msaaTexture.createView();
-						resolveTarget = textureView;
-
-					} else {
-
-						view = textureView;
-						resolveTarget = undefined;
-
-					}
-
-					colorAttachments.push( {
-						view,
-						resolveTarget,
-						clearValue,
-						loadOp: GPULoadOp.Clear,
-						storeOp: GPUStoreOp.Store
-					} );
-
-				}
+				colorAttachments = descriptor.colorAttachments;
 
 			}
 
 			if ( supportsDepth || supportsStencil ) {
 
-				const depthTextureData = this.get( renderTargetData.depthTexture );
+				const depthTextureData = this.get( renderTargetContext.depthTexture );
 
 				depthStencilAttachment = {
 					view: depthTextureData.texture.createView()
@@ -747,7 +949,7 @@ class WebGPUBackend extends Backend {
 
 		//
 
-		const encoder = device.createCommandEncoder( {} );
+		const encoder = device.createCommandEncoder( { label: 'clear' } );
 		const currentPass = encoder.beginRenderPass( {
 			colorAttachments,
 			depthStencilAttachment
@@ -761,21 +963,37 @@ class WebGPUBackend extends Backend {
 
 	// compute
 
+	/**
+	 * This method is executed at the beginning of a compute call and
+	 * prepares the state for upcoming compute tasks.
+	 *
+	 * @param {Node|Array<Node>} computeGroup - The compute node(s).
+	 */
 	beginCompute( computeGroup ) {
 
 		const groupGPU = this.get( computeGroup );
 
 
-		const descriptor = {};
+		const descriptor = {
+			label: 'computeGroup_' + computeGroup.id
+		};
 
 		this.initTimestampQuery( computeGroup, descriptor );
 
-		groupGPU.cmdEncoderGPU = this.device.createCommandEncoder();
+		groupGPU.cmdEncoderGPU = this.device.createCommandEncoder( { label: 'computeGroup_' + computeGroup.id } );
 
 		groupGPU.passEncoderGPU = groupGPU.cmdEncoderGPU.beginComputePass( descriptor );
 
 	}
 
+	/**
+	 * Executes a compute command for the given compute node.
+	 *
+	 * @param {Node|Array<Node>} computeGroup - The group of compute nodes of a compute call. Can be a single compute node.
+	 * @param {Node} computeNode - The compute node.
+	 * @param {Array<BindGroup>} bindings - The bindings.
+	 * @param {ComputePipeline} pipeline - The compute pipeline.
+	 */
 	compute( computeGroup, computeNode, bindings, pipeline ) {
 
 		const { passEncoderGPU } = this.get( computeGroup );
@@ -823,20 +1041,43 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * This method is executed at the end of a compute call and
+	 * finalizes work after compute tasks.
+	 *
+	 * @param {Node|Array<Node>} computeGroup - The compute node(s).
+	 */
 	finishCompute( computeGroup ) {
 
 		const groupData = this.get( computeGroup );
 
 		groupData.passEncoderGPU.end();
 
-		this.prepareTimestampBuffer( computeGroup, groupData.cmdEncoderGPU );
-
 		this.device.queue.submit( [ groupData.cmdEncoderGPU.finish() ] );
+
+	}
+
+	/**
+	 * Can be used to synchronize CPU operations with GPU tasks. So when this method is called,
+	 * the CPU waits for the GPU to complete its operation (e.g. a compute task).
+	 *
+	 * @async
+	 * @return {Promise} A Promise that resolves when synchronization has been finished.
+	 */
+	async waitForGPU() {
+
+		await this.device.queue.onSubmittedWorkDone();
 
 	}
 
 	// render object
 
+	/**
+	 * Executes a draw command for the given render object.
+	 *
+	 * @param {RenderObject} renderObject - The render object to draw.
+	 * @param {Info} info - Holds a series of statistical information about the GPU memory and the rendering process.
+	 */
 	draw( renderObject, info ) {
 
 		const { object, context, pipeline } = renderObject;
@@ -846,9 +1087,9 @@ class WebGPUBackend extends Backend {
 		const currentSets = renderContextData.currentSets;
 		const passEncoderGPU = renderContextData.currentPass;
 
-		const drawParms = renderObject.getDrawParameters();
+		const drawParams = renderObject.getDrawParameters();
 
-		if ( drawParms === null ) return;
+		if ( drawParams === null ) return;
 
 		// pipeline
 
@@ -950,39 +1191,133 @@ class WebGPUBackend extends Backend {
 
 		// draw
 
-		if ( object.isBatchedMesh === true ) {
+		const draw = () => {
 
-			const starts = object._multiDrawStarts;
-			const counts = object._multiDrawCounts;
-			const drawCount = object._multiDrawCount;
-			const drawInstances = object._multiDrawInstances;
+			if ( object.isBatchedMesh === true ) {
 
-			const bytesPerElement = hasIndex ? index.array.BYTES_PER_ELEMENT : 1;
+				const starts = object._multiDrawStarts;
+				const counts = object._multiDrawCounts;
+				const drawCount = object._multiDrawCount;
+				const drawInstances = object._multiDrawInstances;
 
-			for ( let i = 0; i < drawCount; i ++ ) {
+				for ( let i = 0; i < drawCount; i ++ ) {
 
-				const count = drawInstances ? drawInstances[ i ] : 1;
-				const firstInstance = count > 1 ? 0 : i;
+					const count = drawInstances ? drawInstances[ i ] : 1;
+					const firstInstance = count > 1 ? 0 : i;
 
-				passEncoderGPU.drawIndexed( counts[ i ], count, starts[ i ] / bytesPerElement, 0, firstInstance );
+					if ( hasIndex === true ) {
+
+						passEncoderGPU.drawIndexed( counts[ i ], count, starts[ i ] / index.array.BYTES_PER_ELEMENT, 0, firstInstance );
+
+					} else {
+
+						passEncoderGPU.draw( counts[ i ], count, starts[ i ], firstInstance );
+
+					}
+
+				}
+
+			} else if ( hasIndex === true ) {
+
+				const { vertexCount: indexCount, instanceCount, firstVertex: firstIndex } = drawParams;
+
+				const indirect = renderObject.getIndirect();
+
+				if ( indirect !== null ) {
+
+					const buffer = this.get( indirect ).buffer;
+
+					passEncoderGPU.drawIndexedIndirect( buffer, 0 );
+
+				} else {
+
+					passEncoderGPU.drawIndexed( indexCount, instanceCount, firstIndex, 0, 0 );
+
+				}
+
+				info.update( object, indexCount, instanceCount );
+
+			} else {
+
+				const { vertexCount, instanceCount, firstVertex } = drawParams;
+
+				const indirect = renderObject.getIndirect();
+
+				if ( indirect !== null ) {
+
+					const buffer = this.get( indirect ).buffer;
+
+					passEncoderGPU.drawIndirect( buffer, 0 );
+
+				} else {
+
+					passEncoderGPU.draw( vertexCount, instanceCount, firstVertex, 0 );
+
+				}
+
+				info.update( object, vertexCount, instanceCount );
 
 			}
 
-		} else if ( hasIndex === true ) {
+		};
 
-			const { vertexCount: indexCount, instanceCount, firstVertex: firstIndex } = drawParms;
+		if ( renderObject.camera.isArrayCamera && renderObject.camera.cameras.length > 0 ) {
 
-			passEncoderGPU.drawIndexed( indexCount, instanceCount, firstIndex, 0, 0 );
+			const cameraData = this.get( renderObject.camera );
+			const cameras = renderObject.camera.cameras;
+			const cameraIndex = renderObject.getBindingGroup( 'cameraIndex' );
 
-			info.update( object, indexCount, instanceCount );
+			if ( cameraData.indexesGPU === undefined || cameraData.indexesGPU.length !== cameras.length ) {
+
+				const bindingsData = this.get( cameraIndex );
+				const indexesGPU = [];
+
+				const data = new Uint32Array( [ 0, 0, 0, 0 ] );
+
+				for ( let i = 0, len = cameras.length; i < len; i ++ ) {
+
+					data[ 0 ] = i;
+
+					const bindGroupIndex = this.bindingUtils.createBindGroupIndex( data, bindingsData.layout );
+
+					indexesGPU.push( bindGroupIndex );
+
+				}
+
+				cameraData.indexesGPU = indexesGPU; // TODO: Create a global library for this
+
+			}
+
+			const pixelRatio = this.renderer.getPixelRatio();
+
+			for ( let i = 0, len = cameras.length; i < len; i ++ ) {
+
+				const subCamera = cameras[ i ];
+
+				if ( object.layers.test( subCamera.layers ) ) {
+
+					const vp = subCamera.viewport;
+
+					passEncoderGPU.setViewport(
+						Math.floor( vp.x * pixelRatio ),
+						Math.floor( vp.y * pixelRatio ),
+						Math.floor( vp.width * pixelRatio ),
+						Math.floor( vp.height * pixelRatio ),
+						context.viewportValue.minDepth,
+						context.viewportValue.maxDepth
+					);
+
+					passEncoderGPU.setBindGroup( cameraIndex.index, cameraData.indexesGPU[ i ] );
+
+					draw();
+
+				}
+
+			}
 
 		} else {
 
-			const { vertexCount, instanceCount, firstVertex } = drawParms;
-
-			passEncoderGPU.draw( vertexCount, instanceCount, firstVertex, 0 );
-
-			info.update( object, vertexCount, instanceCount );
+			draw();
 
 		}
 
@@ -990,6 +1325,12 @@ class WebGPUBackend extends Backend {
 
 	// cache key
 
+	/**
+	 * Returns `true` if the render pipeline requires an update.
+	 *
+	 * @param {RenderObject} renderObject - The render object.
+	 * @return {Boolean} Whether the render pipeline requires an update or not.
+	 */
 	needsRenderUpdate( renderObject ) {
 
 		const data = this.get( renderObject );
@@ -1018,7 +1359,7 @@ class WebGPUBackend extends Backend {
 			data.sampleCount !== sampleCount || data.colorSpace !== colorSpace ||
 			data.colorFormat !== colorFormat || data.depthStencilFormat !== depthStencilFormat ||
 			data.primitiveTopology !== primitiveTopology ||
-			data.clippingContextCacheKey !== renderObject.clippingContext.cacheKey
+			data.clippingContextCacheKey !== renderObject.clippingContextCacheKey
 		) {
 
 			data.material = material; data.materialVersion = material.version;
@@ -1036,7 +1377,7 @@ class WebGPUBackend extends Backend {
 			data.colorFormat = colorFormat;
 			data.depthStencilFormat = depthStencilFormat;
 			data.primitiveTopology = primitiveTopology;
-			data.clippingContextCacheKey = renderObject.clippingContext.cacheKey;
+			data.clippingContextCacheKey = renderObject.clippingContextCacheKey;
 
 			needsUpdate = true;
 
@@ -1046,6 +1387,12 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * Returns a cache key that is used to identify render pipelines.
+	 *
+	 * @param {RenderObject} renderObject - The render object.
+	 * @return {String} The cache key.
+	 */
 	getRenderCacheKey( renderObject ) {
 
 		const { object, material } = renderObject;
@@ -1066,160 +1413,153 @@ class WebGPUBackend extends Backend {
 			utils.getSampleCountRenderContext( renderContext ),
 			utils.getCurrentColorSpace( renderContext ), utils.getCurrentColorFormat( renderContext ), utils.getCurrentDepthStencilFormat( renderContext ),
 			utils.getPrimitiveTopology( object, material ),
-			renderObject.clippingContext.cacheKey
+			renderObject.getGeometryCacheKey(),
+			renderObject.clippingContextCacheKey
 		].join();
 
 	}
 
 	// textures
 
+	/**
+	 * Creates a GPU sampler for the given texture.
+	 *
+	 * @param {Texture} texture - The texture to create the sampler for.
+	 */
 	createSampler( texture ) {
 
 		this.textureUtils.createSampler( texture );
 
 	}
 
+	/**
+	 * Destroys the GPU sampler for the given texture.
+	 *
+	 * @param {Texture} texture - The texture to destroy the sampler for.
+	 */
 	destroySampler( texture ) {
 
 		this.textureUtils.destroySampler( texture );
 
 	}
 
+	/**
+	 * Creates a default texture for the given texture that can be used
+	 * as a placeholder until the actual texture is ready for usage.
+	 *
+	 * @param {Texture} texture - The texture to create a default texture for.
+	 */
 	createDefaultTexture( texture ) {
 
 		this.textureUtils.createDefaultTexture( texture );
 
 	}
 
+	/**
+	 * Defines a texture on the GPU for the given texture object.
+	 *
+	 * @param {Texture} texture - The texture.
+	 * @param {Object} [options={}] - Optional configuration parameter.
+	 */
 	createTexture( texture, options ) {
 
 		this.textureUtils.createTexture( texture, options );
 
 	}
 
+	/**
+	 * Uploads the updated texture data to the GPU.
+	 *
+	 * @param {Texture} texture - The texture.
+	 * @param {Object} [options={}] - Optional configuration parameter.
+	 */
 	updateTexture( texture, options ) {
 
 		this.textureUtils.updateTexture( texture, options );
 
 	}
 
+	/**
+	 * Generates mipmaps for the given texture.
+	 *
+	 * @param {Texture} texture - The texture.
+	 */
 	generateMipmaps( texture ) {
 
 		this.textureUtils.generateMipmaps( texture );
 
 	}
 
+	/**
+	 * Destroys the GPU data for the given texture object.
+	 *
+	 * @param {Texture} texture - The texture.
+	 */
 	destroyTexture( texture ) {
 
 		this.textureUtils.destroyTexture( texture );
 
 	}
 
-	copyTextureToBuffer( texture, x, y, width, height, faceIndex ) {
+	/**
+	 * Returns texture data as a typed array.
+	 *
+	 * @async
+	 * @param {Texture} texture - The texture to copy.
+	 * @param {Number} x - The x coordinate of the copy origin.
+	 * @param {Number} y - The y coordinate of the copy origin.
+	 * @param {Number} width - The width of the copy.
+	 * @param {Number} height - The height of the copy.
+	 * @param {Number} faceIndex - The face index.
+	 * @return {Promise<TypedArray>} A Promise that resolves with a typed array when the copy operation has finished.
+	 */
+	async copyTextureToBuffer( texture, x, y, width, height, faceIndex ) {
 
 		return this.textureUtils.copyTextureToBuffer( texture, x, y, width, height, faceIndex );
 
 	}
 
-
+	/**
+	 * Inits a time stamp query for the given render context.
+	 *
+	 * @param {RenderContext} renderContext - The render context.
+	 * @param {Object} descriptor - The query descriptor.
+	 */
 	initTimestampQuery( renderContext, descriptor ) {
 
 		if ( ! this.trackTimestamp ) return;
 
-		const renderContextData = this.get( renderContext );
+		const type = renderContext.isComputeNode ? 'compute' : 'render';
 
-		if ( ! renderContextData.timeStampQuerySet ) {
+		if ( ! this.timestampQueryPool[ type ] ) {
 
-			// Create a GPUQuerySet which holds 2 timestamp query results: one for the
-			// beginning and one for the end of compute pass execution.
-			const timeStampQuerySet = this.device.createQuerySet( { type: 'timestamp', count: 2 } );
-
-			const timestampWrites = {
-				querySet: timeStampQuerySet,
-				beginningOfPassWriteIndex: 0, // Write timestamp in index 0 when pass begins.
-				endOfPassWriteIndex: 1, // Write timestamp in index 1 when pass ends.
-			};
-
-			Object.assign( descriptor, {
-				timestampWrites,
-			} );
-
-			renderContextData.timeStampQuerySet = timeStampQuerySet;
+			// TODO: Variable maxQueries?
+			this.timestampQueryPool[ type ] = new WebGPUTimestampQueryPool( this.device, type, 2048 );
 
 		}
 
-	}
+		const timestampQueryPool = this.timestampQueryPool[ type ];
 
-	// timestamp utils
+		const baseOffset = timestampQueryPool.allocateQueriesForContext( renderContext );
 
-	prepareTimestampBuffer( renderContext, encoder ) {
-
-		if ( ! this.trackTimestamp ) return;
-
-		const renderContextData = this.get( renderContext );
-
-
-		const size = 2 * BigInt64Array.BYTES_PER_ELEMENT;
-
-		if ( renderContextData.currentTimestampQueryBuffers === undefined ) {
-
-			renderContextData.currentTimestampQueryBuffers = {
-				resolveBuffer: this.device.createBuffer( {
-					label: 'timestamp resolve buffer',
-					size: size,
-					usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
-				} ),
-				resultBuffer: this.device.createBuffer( {
-					label: 'timestamp result buffer',
-					size: size,
-					usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-				} ),
-				isMappingPending: false,
-			};
-
-		}
-
-		const { resolveBuffer, resultBuffer, isMappingPending } = renderContextData.currentTimestampQueryBuffers;
-
-		if ( isMappingPending === true ) return;
-
-		encoder.resolveQuerySet( renderContextData.timeStampQuerySet, 0, 2, resolveBuffer, 0 );
-		encoder.copyBufferToBuffer( resolveBuffer, 0, resultBuffer, 0, size );
+		descriptor.timestampWrites = {
+			querySet: timestampQueryPool.querySet,
+			beginningOfPassWriteIndex: baseOffset,
+			endOfPassWriteIndex: baseOffset + 1,
+		  };
 
 	}
 
-	async resolveTimestampAsync( renderContext, type = 'render' ) {
-
-		if ( ! this.trackTimestamp ) return;
-
-		const renderContextData = this.get( renderContext );
-
-		if ( renderContextData.currentTimestampQueryBuffers === undefined ) return;
-
-		const { resultBuffer, isMappingPending } = renderContextData.currentTimestampQueryBuffers;
-
-		if ( isMappingPending === true ) return;
-
-		renderContextData.currentTimestampQueryBuffers.isMappingPending = true;
-
-		resultBuffer.mapAsync( GPUMapMode.READ ).then( () => {
-
-			const times = new BigUint64Array( resultBuffer.getMappedRange() );
-			const duration = Number( times[ 1 ] - times[ 0 ] ) / 1000000;
-
-
-			this.renderer.info.updateTimestamp( type, duration );
-
-			resultBuffer.unmap();
-
-			renderContextData.currentTimestampQueryBuffers.isMappingPending = false;
-
-		} );
-
-	}
 
 	// node builder
 
+	/**
+	 * Returns a node builder for the given render object.
+	 *
+	 * @param {RenderObject} object - The render object.
+	 * @param {Renderer} renderer - The renderer.
+	 * @return {WGSLNodeBuilder} The node builder.
+	 */
 	createNodeBuilder( object, renderer ) {
 
 		return new WGSLNodeBuilder( object, renderer );
@@ -1228,17 +1568,27 @@ class WebGPUBackend extends Backend {
 
 	// program
 
+	/**
+	 * Creates a shader program from the given programmable stage.
+	 *
+	 * @param {ProgrammableStage} program - The programmable stage.
+	 */
 	createProgram( program ) {
 
 		const programGPU = this.get( program );
 
 		programGPU.module = {
-			module: this.device.createShaderModule( { code: program.code, label: program.stage } ),
+			module: this.device.createShaderModule( { code: program.code, label: program.stage + ( program.name !== '' ? `_${ program.name }` : '' ) } ),
 			entryPoint: 'main'
 		};
 
 	}
 
+	/**
+	 * Destroys the shader program of the given programmable stage.
+	 *
+	 * @param {ProgrammableStage} program - The programmable stage.
+	 */
 	destroyProgram( program ) {
 
 		this.delete( program );
@@ -1247,18 +1597,35 @@ class WebGPUBackend extends Backend {
 
 	// pipelines
 
+	/**
+	 * Creates a render pipeline for the given render object.
+	 *
+	 * @param {RenderObject} renderObject - The render object.
+	 * @param {Array<Promise>} promises - An array of compilation promises which are used in `compileAsync()`.
+	 */
 	createRenderPipeline( renderObject, promises ) {
 
 		this.pipelineUtils.createRenderPipeline( renderObject, promises );
 
 	}
 
+	/**
+	 * Creates a compute pipeline for the given compute node.
+	 *
+	 * @param {ComputePipeline} computePipeline - The compute pipeline.
+	 * @param {Array<BindGroup>} bindings - The bindings.
+	 */
 	createComputePipeline( computePipeline, bindings ) {
 
 		this.pipelineUtils.createComputePipeline( computePipeline, bindings );
 
 	}
 
+	/**
+	 * Prepares the state for encoding render bundles.
+	 *
+	 * @param {RenderContext} renderContext - The render context.
+	 */
 	beginBundle( renderContext ) {
 
 		const renderContextData = this.get( renderContext );
@@ -1271,6 +1638,12 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * After processing render bundles this method finalizes related work.
+	 *
+	 * @param {RenderContext} renderContext - The render context.
+	 * @param {RenderBundle} bundle - The render bundle.
+	 */
 	finishBundle( renderContext, bundle ) {
 
 		const renderContextData = this.get( renderContext );
@@ -1287,6 +1660,12 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * Adds a render bundle to the render context data.
+	 *
+	 * @param {RenderContext} renderContext - The render context.
+	 * @param {RenderBundle} bundle - The render bundle to add.
+	 */
 	addBundle( renderContext, bundle ) {
 
 		const renderContextData = this.get( renderContext );
@@ -1297,18 +1676,39 @@ class WebGPUBackend extends Backend {
 
 	// bindings
 
-	createBindings( bindGroup ) {
+	/**
+	 * Creates bindings from the given bind group definition.
+	 *
+	 * @param {BindGroup} bindGroup - The bind group.
+	 * @param {Array<BindGroup>} bindings - Array of bind groups.
+	 * @param {Number} cacheIndex - The cache index.
+	 * @param {Number} version - The version.
+	 */
+	createBindings( bindGroup, bindings, cacheIndex, version ) {
 
-		this.bindingUtils.createBindings( bindGroup );
+		this.bindingUtils.createBindings( bindGroup, bindings, cacheIndex, version );
 
 	}
 
-	updateBindings( bindGroup ) {
+	/**
+	 * Updates the given bind group definition.
+	 *
+	 * @param {BindGroup} bindGroup - The bind group.
+	 * @param {Array<BindGroup>} bindings - Array of bind groups.
+	 * @param {Number} cacheIndex - The cache index.
+	 * @param {Number} version - The version.
+	 */
+	updateBindings( bindGroup, bindings, cacheIndex, version ) {
 
-		this.bindingUtils.createBindings( bindGroup );
+		this.bindingUtils.createBindings( bindGroup, bindings, cacheIndex, version );
 
 	}
 
+	/**
+	 * Updates a buffer binding.
+	 *
+	 *  @param {Buffer} binding - The buffer binding to update.
+	 */
 	updateBinding( binding ) {
 
 		this.bindingUtils.updateBinding( binding );
@@ -1317,30 +1717,66 @@ class WebGPUBackend extends Backend {
 
 	// attributes
 
+	/**
+	 * Creates the buffer of an indexed shader attribute.
+	 *
+	 * @param {BufferAttribute} attribute - The indexed buffer attribute.
+	 */
 	createIndexAttribute( attribute ) {
 
 		this.attributeUtils.createAttribute( attribute, GPUBufferUsage.INDEX | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST );
 
 	}
 
+	/**
+	 * Creates the GPU buffer of a shader attribute.
+	 *
+	 * @param {BufferAttribute} attribute - The buffer attribute.
+	 */
 	createAttribute( attribute ) {
 
 		this.attributeUtils.createAttribute( attribute, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST );
 
 	}
 
+	/**
+	 * Creates the GPU buffer of a storage attribute.
+	 *
+	 * @param {BufferAttribute} attribute - The buffer attribute.
+	 */
 	createStorageAttribute( attribute ) {
 
 		this.attributeUtils.createAttribute( attribute, GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST );
 
 	}
 
+	/**
+	 * Creates the GPU buffer of an indirect storage attribute.
+	 *
+	 * @param {BufferAttribute} attribute - The buffer attribute.
+	 */
+	createIndirectStorageAttribute( attribute ) {
+
+		this.attributeUtils.createAttribute( attribute, GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST );
+
+	}
+
+	/**
+	 * Updates the GPU buffer of a shader attribute.
+	 *
+	 * @param {BufferAttribute} attribute - The buffer attribute to update.
+	 */
 	updateAttribute( attribute ) {
 
 		this.attributeUtils.updateAttribute( attribute );
 
 	}
 
+	/**
+	 * Destroys the GPU buffer of a shader attribute.
+	 *
+	 * @param {BufferAttribute} attribute - The buffer attribute to destroy.
+	 */
 	destroyAttribute( attribute ) {
 
 		this.attributeUtils.destroyAttribute( attribute );
@@ -1349,6 +1785,9 @@ class WebGPUBackend extends Backend {
 
 	// canvas
 
+	/**
+	 * Triggers an update of the default render pass descriptor.
+	 */
 	updateSize() {
 
 		this.colorBuffer = this.textureUtils.getColorBuffer();
@@ -1358,18 +1797,38 @@ class WebGPUBackend extends Backend {
 
 	// utils public
 
+	/**
+	 * Returns the maximum anisotropy texture filtering value.
+	 *
+	 * @return {Number} The maximum anisotropy texture filtering value.
+	 */
 	getMaxAnisotropy() {
 
 		return 16;
 
 	}
 
+	/**
+	 * Checks if the given feature is supported  by the backend.
+	 *
+	 * @param {String} name - The feature's name.
+	 * @return {Boolean} Whether the feature is supported or not.
+	 */
 	hasFeature( name ) {
 
 		return this.device.features.has( name );
 
 	}
 
+	/**
+	 * Copies data of the given source texture to the given destination texture.
+	 *
+	 * @param {Texture} srcTexture - The source texture.
+	 * @param {Texture} dstTexture - The destination texture.
+	 * @param {Vector4?} [srcRegion=null] - The region of the source texture to copy.
+	 * @param {(Vector2|Vector3)?} [dstPosition=null] - The destination position of the copy.
+	 * @param {Number} [level=0] - The mip level to copy.
+	 */
 	copyTextureToTexture( srcTexture, dstTexture, srcRegion = null, dstPosition = null, level = 0 ) {
 
 		let dstX = 0;
@@ -1428,11 +1887,16 @@ class WebGPUBackend extends Backend {
 
 	}
 
+	/**
+	 * Copies the current bound framebuffer to the given texture.
+	 *
+	 * @param {Texture} texture - The destination texture.
+	 * @param {RenderContext} renderContext - The render context.
+	 * @param {Vector4} rectangle - A four dimensional vector defining the origin and dimension of the copy.
+	 */
 	copyFramebufferToTexture( texture, renderContext, rectangle ) {
 
 		const renderContextData = this.get( renderContext );
-
-		const { encoder, descriptor } = renderContextData;
 
 		let sourceGPU = null;
 
@@ -1472,12 +1936,24 @@ class WebGPUBackend extends Backend {
 
 		}
 
-		renderContextData.currentPass.end();
+		let encoder;
+
+		if ( renderContextData.currentPass ) {
+
+			renderContextData.currentPass.end();
+
+			encoder = renderContextData.encoder;
+
+		} else {
+
+			encoder = this.device.createCommandEncoder( { label: 'copyFramebufferToTexture_' + texture.id } );
+
+		}
 
 		encoder.copyTextureToTexture(
 			{
 				texture: sourceGPU,
-				origin: { x: rectangle.x, y: rectangle.y, z: 0 }
+				origin: [ rectangle.x, rectangle.y, 0 ],
 			},
 			{
 				texture: destinationGPU
@@ -1490,17 +1966,41 @@ class WebGPUBackend extends Backend {
 
 		if ( texture.generateMipmaps ) this.textureUtils.generateMipmaps( texture );
 
-		for ( let i = 0; i < descriptor.colorAttachments.length; i ++ ) {
+		if ( renderContextData.currentPass ) {
 
-			descriptor.colorAttachments[ i ].loadOp = GPULoadOp.Load;
+			const { descriptor } = renderContextData;
+
+			for ( let i = 0; i < descriptor.colorAttachments.length; i ++ ) {
+
+				descriptor.colorAttachments[ i ].loadOp = GPULoadOp.Load;
+
+			}
+
+			if ( renderContext.depth ) descriptor.depthStencilAttachment.depthLoadOp = GPULoadOp.Load;
+			if ( renderContext.stencil ) descriptor.depthStencilAttachment.stencilLoadOp = GPULoadOp.Load;
+
+			renderContextData.currentPass = encoder.beginRenderPass( descriptor );
+			renderContextData.currentSets = { attributes: {}, bindingGroups: [], pipeline: null, index: null };
+
+			if ( renderContext.viewport ) {
+
+				this.updateViewport( renderContext );
+
+			}
+
+			if ( renderContext.scissor ) {
+
+				const { x, y, width, height } = renderContext.scissorValue;
+
+				renderContextData.currentPass.setScissorRect( x, y, width, height );
+
+			}
+
+		} else {
+
+			this.device.queue.submit( [ encoder.finish() ] );
 
 		}
-
-		if ( renderContext.depth ) descriptor.depthStencilAttachment.depthLoadOp = GPULoadOp.Load;
-		if ( renderContext.stencil ) descriptor.depthStencilAttachment.stencilLoadOp = GPULoadOp.Load;
-
-		renderContextData.currentPass = encoder.beginRenderPass( descriptor );
-		renderContextData.currentSets = { attributes: {}, bindingGroups: [], pipeline: null, index: null };
 
 	}
 
